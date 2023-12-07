@@ -1,4 +1,7 @@
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from datetime import datetime, timezone, timedelta
+
 import time
 import json
 from pdf2image import convert_from_bytes
@@ -12,15 +15,25 @@ from chatbots.chatgpt import ChatGPT, models, ASK_TEMPLATE
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from config import *
 from functools import reduce
+import assemblyai as aai
 
 # Set up the storage client using the JSON key file
 bucket_name = 'juris-tsunzu-gpt-bucket'
-blob_name = 'user-uploaded-files/'
+uploaded_blob_name = 'user-uploaded-files/'
 
 storage_client = storage.Client.from_service_account_json('/root/workspace/gkey/juris-gpt-key.json')
 vision_client = vision.ImageAnnotatorClient()
 
 bucket = storage_client.bucket(bucket_name)
+
+aai.settings.api_key = assemeblyAI_api_key
+
+transcriber = aai.Transcriber()
+
+txt_splitter = RecursiveCharacterTextSplitter(
+                chunk_size = 160000,
+                chunk_overlap  = 200
+            )
 
 # Configures
 st.set_page_config(layout="wide")
@@ -63,8 +76,10 @@ def initialization():
         st.session_state.text_reduce_prompt = ""
     if "full_response" not in st.session_state:
         st.session_state.full_response = ""
-    if "st.session_state.uploaded_files" not in st.session_state:
+    if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = []
+    if "trial_num" not in st.session_state:
+        st.session_state.trial_num = 0
 
 create_bot = st.sidebar.button("Create Bot", on_click=initialization)
 
@@ -78,6 +93,7 @@ def clear_session():
     st.session_state["bot"] = None
     st.session_state["text_map_prompt"] = ""
     st.session_state["full_response"] = ""
+    st.session_state["trial_num"] = 0
     
 # Button: Clear
 clear_button = st.sidebar.button("Clear", on_click=clear_session)
@@ -133,6 +149,26 @@ def render():
             st.markdown(message["content"])
 render()
 
+def upload_to_folder(folder_path, file_name, string_data):
+    blob = bucket.blob(f"{folder_path}/{file_name}")
+    print(f"save to {folder_path}/{file_name}")
+    blob.upload_from_string(string_data)
+
+def create_service_url(file_path):
+
+    #Get the time in UTC
+    ini_time_for_now = datetime.now(timezone.utc)
+    #Set the expiration time
+    expiration_time = ini_time_for_now + timedelta(minutes = 1) 
+    
+    #Initialize the bucket and blob
+    blob = bucket.blob(file_path)
+    
+    #Get the signed URL
+    url = blob.generate_signed_url(expiration = expiration_time)
+    
+    #Print the URL
+    return(url)
 
 # image to text using Google Vision API
 def detect_labels(img_byte_arr, i):
@@ -172,6 +208,8 @@ def analyze_filelist(file_list):
 
 
 disable_input = st.session_state.bot is None
+ctx = get_script_run_ctx()
+session_id = ctx.session_id
 
 st.header("Step 1: Please upload pdf files")
 
@@ -204,40 +242,55 @@ def generate():
     pdf_source = files['pdf']
     audio_source = files['audio']
     pic_source = files['pics']
-    docs = []
+    docs_pdf = []
+    docs_audio = []
+    docs_pic = []
 
     ## parse pdf files
+    print(pdf_source)
     
-    if pdf_source is not []:
+    if pdf_source != []:
         st.toast("Parsing pdf files...")
         extracted_data = {}
         for pdf_id in range(len(pdf_source)):
-            base64_pdf = base64.b64encode(pdf_source[pdf_id].getvalue()).decode('utf-8')
             pdf_source[pdf_id].seek(0)
             print("_____________\n")
-            print(f"{blob_name}PDF/{pdf_source[pdf_id].name}")
-            blob = bucket.blob(f"{blob_name}PDF/{pdf_source[pdf_id].name}")
-            blob.upload_from_string(pdf_source[pdf_id].getvalue())
+            print(f"{uploaded_blob_name}PDF/{pdf_source[pdf_id].name}")
+            # blob = bucket.blob(f"{uploaded_blob_name}PDF/{pdf_source[pdf_id].name}")
+            # blob.upload_from_string(pdf_source[pdf_id].getvalue())
+            upload_to_folder(f"{uploaded_blob_name}PDF", f"{pdf_source[pdf_id].name}", pdf_source[pdf_id].getvalue())
             images = convert_from_bytes(pdf_source[pdf_id].getvalue())
             extracted_data[pdf_source[pdf_id].name] = ""
             for i, image in enumerate(images):
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='JPEG')
                 img_byte_arr = img_byte_arr.getvalue()
-                
                 extracted_data[pdf_source[pdf_id].name] += detect_labels(img_byte_arr, i)
-        print("Extracted data:", extracted_data)
+
+        st.toast('Saving the extracted data with pretty view...')
 
         map_result = ""
         txt_splitter = RecursiveCharacterTextSplitter(
-                chunk_size = 160000,
-                chunk_overlap  = 200
-            )
-
+                        chunk_size = 160000,
+                        chunk_overlap  = 200
+                    )
         for pdf_idx in extracted_data:
-            docs += txt_splitter.create_documents([extracted_data[pdf_idx]])
+            extracted_data[pdf_idx] = txt_splitter.create_documents([extracted_data[pdf_idx]])
+        
+        docs_pdf = reduce(lambda a, b: a + b, extracted_data.values())
 
-        print("\n\n_________________________________________\n\n", docs)
+        print("\n\n____________________docs_____________________\n\n", docs_pdf)
+        print("\n\n______________________extracted_data___________________\n\n", extracted_data)
+        for idx in extracted_data.keys():
+            tmp = ""
+            for doc in extracted_data[idx]:
+                for response in st.session_state.bot.ask_llm(doc.page_content + "\n rewrite with good spacing and line breaks.", stream=True):
+                    tmp += response
+            print(f"\n\n________{idx}", tmp)
+            # blob = bucket.blob(f"Extracted/{idx}_ext.txt")
+            # blob.upload_from_string(tmp)
+            upload_to_folder("Extracted-PDF", f"{idx}_ext.txt", tmp)
+
 
     else:
         st.toast("No Pdf files detected...skipping")
@@ -245,31 +298,53 @@ def generate():
 
     ## parse audio files
 
-    if audio_source is not []:
+    if audio_source != []:
         st.toast("Parsing audio files...")
-        extracted_data = {}
+        txt_splitter = RecursiveCharacterTextSplitter(
+                chunk_size = 160000,
+                chunk_overlap  = 200
+            )
         for audio_id in range(len(audio_source)):
-            base64_audio = base64.b64encode(audio_source[audio_id].getvalue()).decode('utf-8')
             audio_source[audio_id].seek(0)
-            audios = convert_from_bytes(audio_source[audio_id].getvalue())
-            extracted_data[audio_source[audio_id].name] = ""
-            for idx, audio in enumerate(audio_source):
-                audio_byte_arr = io.BytesIO()
-                audio.save(img_byte_arr, format='.mp3')
-                audio_byte_arr = audio_byte_arr.getvalue()
+            upload_to_folder(f"{uploaded_blob_name}AUDIO", f"{audio_source[audio_id].name}", audio_source[audio_id].getvalue())
+            url = create_service_url(f"{uploaded_blob_name}AUDIO/" + f"{audio_source[audio_id].name}")
+            print(url)
+            transcript = transcriber.transcribe(url)
+            print(transcript.text)
+            docs_audio += txt_splitter.create_documents([transcript.text])
+            upload_to_folder("Extracted-AUDIO", f"{audio_source[audio_id].name}_ext.txt", transcript.text)
     else:
         st.toast("No audio source detected...skipping...")
 
     ## parse pic files
 
-    if pic_source is not []:
+    if pic_source != []:
         st.toast("Parsing pictures...")
+        st.toast("Parsing pic files...")
+        txt_splitter = RecursiveCharacterTextSplitter(
+                chunk_size = 160000,
+                chunk_overlap  = 200
+            )
+        for pic_id in range(len(pic_source)):
+            pic_source[pic_id].seek(0)
+            upload_to_folder(f"{uploaded_blob_name}PIC", f"{pic_source[pic_id].name}", pic_source[pic_id].getvalue())
+            # url = create_service_url(f"{uploaded_blob_name}pic" + f"{pic_source[pic_id].name}")
+            transcript = detect_labels(pic_source[pic_id].getvalue(), 0)
+            trans_docs = txt_splitter.create_documents([transcript])
+            docs_audio += trans_docs
+            tmp = ""
+            for doc in trans_docs:
+                for response in st.session_state.bot.ask_llm(doc.page_content + "\n rewrite with good spacing and line breaks.", stream=True):
+                    tmp += response
+            upload_to_folder("Extracted-PIC", f"{pic_source[pic_id].name}_ext.txt", transcript)
     else:
         st.toast("No picture detected...skipping...")
 
     st.session_state.full_response = ""
     st.toast("Generating result...")
     st.toast("Mapping...")
+    docs = docs_pdf + docs_audio + docs_pic
+    print(docs)
     map_results = []
     for doc in docs:
         full_response = ""
@@ -279,8 +354,11 @@ def generate():
 
     st.toast("Reducing...")
     reduce_result = ""
-    for response in st.session_state.bot.ask_llm(st.session_state.text_reduce_input.replace("{text}", reduce(lambda x, y: x+y, map_results)), stream=True):
+    try:
+        for response in st.session_state.bot.ask_llm(st.session_state.text_reduce_input.replace("{text}", reduce(lambda x, y: x+y, map_results)), stream=True):
             reduce_result += response
+    except:
+        st.toast("Detected no documents...please upload files. 😊")
     st.session_state.full_response = reduce_result
 
 st.button("Generate", on_click=generate)
@@ -292,3 +370,6 @@ st.header("Result")
 with st.chat_message("assistance", avatar = "🤖"):
     message_placeholder = st.empty()
     message_placeholder.write(st.session_state.full_response)
+    # blob = bucket.blob(f"Summary/{session_id}/summary{st.session_state.trial_num}.txt")
+    # blob.upload_from_string(st.session_state.full_response)
+    upload_to_folder(f"Summary/{session_id}", f"summary{st.session_state.trial_num}.txt", st.session_state.full_response)
